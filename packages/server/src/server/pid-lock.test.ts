@@ -255,3 +255,55 @@ describe("pid-lock ownership", () => {
     }
   });
 });
+
+describe("pid-lock worker health", () => {
+  test("round-trips a supervisor health verdict without disturbing the lock", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-health-"));
+    await acquirePidLock(paseoHome, "127.0.0.1:6767", { ownerPid: process.pid });
+
+    // A freshly acquired lock carries no verdict, so a new supervisor
+    // generation can never inherit the previous one's health.
+    expect((await getPidLockInfo(paseoHome))?.workerHealth).toBeUndefined();
+
+    await updatePidLock(
+      paseoHome,
+      {
+        workerHealth: {
+          state: "stalled",
+          observedAt: "2026-09-09T11:00:00.000Z",
+          sinceLastAckMs: 9_000,
+          lastRoundTripMs: 14,
+        },
+      },
+      { ownerPid: process.pid },
+    );
+
+    const stalled = await getPidLockInfo(paseoHome);
+    expect(stalled?.workerHealth).toEqual({
+      state: "stalled",
+      observedAt: "2026-09-09T11:00:00.000Z",
+      sinceLastAckMs: 9_000,
+      lastRoundTripMs: 14,
+    });
+    // The health patch must not clobber the rest of the lock.
+    expect(stalled?.pid).toBe(process.pid);
+    expect(stalled?.listen).toBe("127.0.0.1:6767");
+
+    await updatePidLock(
+      paseoHome,
+      {
+        workerHealth: {
+          state: "healthy",
+          observedAt: "2026-09-09T11:00:05.000Z",
+          sinceLastAckMs: 0,
+          lastRoundTripMs: 3,
+        },
+      },
+      { ownerPid: process.pid },
+    );
+    expect((await getPidLockInfo(paseoHome))?.workerHealth?.state).toBe("healthy");
+
+    await releasePidLock(paseoHome, { ownerPid: process.pid });
+    await rm(paseoHome, { recursive: true, force: true });
+  });
+});

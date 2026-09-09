@@ -177,6 +177,29 @@ async function main(): Promise<void> {
     onWorkerReady: async ({ listen }) => {
       await updatePidLock(paseoHome, { listen }, { ownerPid: process.pid });
     },
+    onWorkerHealthChange: async (health) => {
+      // Publish the supervisor's verdict where any out-of-process reader (the
+      // CLI, an external watchdog) can see it without asking the worker, whose
+      // event loop is exactly what is in question. Only transitions are written,
+      // so this is a rare write, not a per-second one.
+      try {
+        await updatePidLock(
+          paseoHome,
+          {
+            workerHealth: {
+              state: health.state,
+              observedAt: new Date().toISOString(),
+              sinceLastAckMs: health.sinceLastAckMs,
+              lastRoundTripMs: health.lastRoundTripMs,
+            },
+          },
+          { ownerPid: process.pid },
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`Failed to publish worker health: ${message}\n`);
+      }
+    },
     onSupervisorExit: releaseLock,
   });
   requestSupervisorShutdown = supervisor.requestShutdown;

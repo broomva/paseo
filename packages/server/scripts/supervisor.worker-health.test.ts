@@ -134,8 +134,10 @@ describe("supervisor worker health", () => {
     // The whole point: a stalled worker is alive, so it must not be respawned.
     expect(result.log.split('"msg":"Spawning worker"').length - 1).toBe(1);
 
-    expect(result.health.map((entry) => entry.state)).toEqual(["stalled", "healthy"]);
-    const [stalledEntry] = result.health;
+    // The leading "healthy" is published on the generation's first ack, so a
+    // respawned worker never inherits a previous generation's stalled verdict.
+    expect(result.health.map((entry) => entry.state)).toEqual(["healthy", "stalled", "healthy"]);
+    const stalledEntry = result.health[1];
     expect(stalledEntry.sinceLastAckMs).toBeGreaterThan(300);
     expect(stalledEntry.workerPid).toBeGreaterThan(0);
   }, 40_000);
@@ -165,6 +167,7 @@ describe("supervisor worker health", () => {
 
     expect(result.code).toBe(0);
     expect(result.log).not.toContain("Worker event loop stalled");
-    expect(result.health).toEqual([]);
+    // A healthy worker publishes exactly one verdict: the initial healthy one.
+    expect(result.health.map((entry) => entry.state)).toEqual(["healthy"]);
   }, 30_000);
 });

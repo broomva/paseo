@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { getOrCreateServerId, findExecutable, execCommand } from "@getpaseo/server";
 import { connectToDaemon } from "../../utils/client.js";
 import type { CommandOptions, ListResult, OutputSchema } from "../../output/index.js";
-import { resolveLocalDaemonState } from "./local-daemon.js";
+import { resolveLocalDaemonState, type LocalDaemonWorkerHealth } from "./local-daemon.js";
 import { resolveNodePathFromPid } from "./runtime-toolchain.js";
 
 const DAEMON_STATUS_PROBE_TIMEOUT_MS = 1500;
@@ -17,7 +17,7 @@ interface ProviderBinaryStatus {
 
 interface DaemonStatus {
   serverId: string | null;
-  localDaemon: "running" | "stopped" | "stale_pid" | "unresponsive";
+  localDaemon: "running" | "stopped" | "stale_pid" | "unresponsive" | "stalled";
   connectedDaemon: "reachable" | "unreachable" | "auth_required" | "auth_failed" | "not_probed";
   home: string;
   listen: string;
@@ -91,7 +91,7 @@ function createStatusSchema(status: DaemonStatus): OutputSchema<StatusRow> {
         color: (_, item) => {
           if (item.key === "Local Daemon") {
             if (item.value === "running") return "green";
-            if (item.value === "unresponsive") return "yellow";
+            if (item.value === "unresponsive" || item.value === "stalled") return "yellow";
             return "red";
           }
           if (item.key === "Connected Daemon") {
@@ -224,6 +224,36 @@ function describeDaemonAuthProbeFailure(host: string, failure: DaemonAuthProbeFa
   return `Daemon is reachable at ${host} but the supplied password was rejected. Check PASEO_PASSWORD and retry.`;
 }
 
+/**
+ * How long a supervisor health record is trusted.
+ *
+ * The supervisor only writes on transitions, so a correct record can legitimately
+ * be old. The window exists for the failure case instead: if a "stalled" record
+ * was written and the matching "recovered" write then failed (a full disk is the
+ * likely cause, and also a likely cause of the stall), the wrong verdict must not
+ * persist forever. Past the window we fall back to the previous behaviour, so the
+ * bound on being wrong is "no worse than before".
+ */
+const WORKER_HEALTH_TRUST_WINDOW_MS = 5 * 60_000;
+
+export function resolveFreshWorkerHealth(
+  health: LocalDaemonWorkerHealth | undefined,
+): LocalDaemonWorkerHealth | undefined {
+  if (!health) {
+    return undefined;
+  }
+  const observedAt = Date.parse(health.observedAt);
+  if (Number.isNaN(observedAt)) {
+    return undefined;
+  }
+  const ageMs = Date.now() - observedAt;
+  // Reject records from the future (clock skew) and records past the window.
+  if (ageMs < -60_000 || ageMs > WORKER_HEALTH_TRUST_WINDOW_MS) {
+    return undefined;
+  }
+  return health;
+}
+
 async function probeDaemonOverWebsocket(args: {
   host: string;
   state: ReturnType<typeof resolveLocalDaemonState>;
@@ -242,6 +272,21 @@ async function probeDaemonOverWebsocket(args: {
     }
 
     if (state.running) {
+      // The handshake failing does not mean the daemon is gone: it is served by
+      // the worker's own event loop, so it fails the same way whether the worker
+      // is blocked or dead. The supervisor observes the worker out-of-process
+      // and can tell those apart, so prefer its verdict when it is fresh.
+      const supervisorHealth = resolveFreshWorkerHealth(state.pidInfo?.workerHealth);
+      if (supervisorHealth?.state === "stalled") {
+        return {
+          connectedDaemon: "unreachable",
+          localDaemonOverride: "stalled",
+          note:
+            `Local daemon is alive but its event loop has been blocked for ` +
+            `${supervisorHealth.sinceLastAckMs}ms (reported by the supervisor). ` +
+            `It is busy, not dead — restarting it will drop in-flight work.`,
+        };
+      }
       return {
         connectedDaemon: "unreachable",
         localDaemonOverride: "unresponsive",

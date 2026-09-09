@@ -401,8 +401,14 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       const now = Date.now();
       lastAckAt = now;
       lastRoundTripMs = Math.max(0, now - sentAt);
+      const isFirstAck = !hasAcked;
       hasAcked = true;
       oldestUnackedSentAt = null;
+      if (isFirstAck) {
+        // Publish a healthy verdict for this worker generation, so a respawned
+        // worker never inherits the previous generation's stalled record.
+        reportHealth("healthy", 0);
+      }
       if (stalled) {
         stalled = false;
         writeLifecycleLog("Worker event loop recovered", {
