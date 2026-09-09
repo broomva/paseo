@@ -7,6 +7,65 @@ import { signalProcessTree } from "../src/utils/tree-kill.js";
 const WORKER_HEARTBEAT_INTERVAL_MS = 1_000;
 const WORKER_TERMINATION_GRACE_MS = 10_000;
 
+/**
+ * Crash-restart defaults.
+ *
+ * A worker that fails during startup (bad config, port already bound, missing
+ * native module) exits immediately every time. Respawning it with no delay turns
+ * that into a hot loop bounded only by fork speed, which starves the very host
+ * that is usually the underlying cause. Backing off and then giving up surfaces
+ * the failure to whatever supervises the supervisor instead of hiding it.
+ */
+const DEFAULT_RESTART_INITIAL_DELAY_MS = 250;
+const DEFAULT_RESTART_MAX_DELAY_MS = 30_000;
+const DEFAULT_RESTART_BACKOFF_FACTOR = 2;
+const DEFAULT_RESTART_JITTER_RATIO = 0.2;
+const DEFAULT_RESTART_MAX_ATTEMPTS = 10;
+/** Uptime after which a worker is considered healthy and the crash counter resets. */
+const DEFAULT_RESTART_STABLE_AFTER_MS = 60_000;
+
+export interface SupervisorRestartPolicy {
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+  factor?: number;
+  /** Random +/- ratio applied to each delay, to avoid synchronised restarts. */
+  jitterRatio?: number;
+  /** Consecutive crashes tolerated before the supervisor gives up. */
+  maxAttempts?: number;
+  stableAfterMs?: number;
+}
+
+interface ResolvedRestartPolicy extends Required<SupervisorRestartPolicy> {}
+
+function resolveRestartPolicy(policy: SupervisorRestartPolicy | undefined): ResolvedRestartPolicy {
+  return {
+    initialDelayMs: policy?.initialDelayMs ?? DEFAULT_RESTART_INITIAL_DELAY_MS,
+    maxDelayMs: policy?.maxDelayMs ?? DEFAULT_RESTART_MAX_DELAY_MS,
+    factor: policy?.factor ?? DEFAULT_RESTART_BACKOFF_FACTOR,
+    jitterRatio: policy?.jitterRatio ?? DEFAULT_RESTART_JITTER_RATIO,
+    maxAttempts: policy?.maxAttempts ?? DEFAULT_RESTART_MAX_ATTEMPTS,
+    stableAfterMs: policy?.stableAfterMs ?? DEFAULT_RESTART_STABLE_AFTER_MS,
+  };
+}
+
+/**
+ * Exponential backoff with jitter. `attempt` is 1-based: the first restart after
+ * a crash waits `initialDelayMs`.
+ */
+export function computeRestartDelayMs(
+  attempt: number,
+  policy: ResolvedRestartPolicy,
+  random: () => number = Math.random,
+): number {
+  const exponent = Math.max(0, attempt - 1);
+  const raw = policy.initialDelayMs * policy.factor ** exponent;
+  const capped = Math.min(policy.maxDelayMs, raw);
+  const jitterSpan = capped * policy.jitterRatio;
+  // random() in [0,1) -> offset in [-jitterSpan, +jitterSpan)
+  const offset = (random() * 2 - 1) * jitterSpan;
+  return Math.max(0, Math.round(capped + offset));
+}
+
 interface SupervisorLogFileOptions {
   path: string;
   rotate: {
@@ -52,6 +111,8 @@ interface SupervisorOptions {
   } | null;
   onWorkerReady?: (message: { listen: string }) => Promise<void> | void;
   restartOnCrash?: boolean;
+  /** Backoff and give-up policy applied to crash restarts only. */
+  restartPolicy?: SupervisorRestartPolicy;
   onSupervisorExit?: () => Promise<void> | void;
   logFile?: SupervisorLogFileOptions;
 }
@@ -125,11 +186,16 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
   const workerExecArgv = options.workerExecArgv ?? ["--import", "tsx"];
   const resolveWorkerSpawnSpec = options.resolveWorkerSpawnSpec;
 
+  const restartPolicy = resolveRestartPolicy(options.restartPolicy);
+
   let child: ChildProcess | null = null;
   let restarting = false;
   let shuttingDown = false;
   let exiting = false;
   let forceKillTimer: NodeJS.Timeout | null = null;
+  let restartTimer: NodeJS.Timeout | null = null;
+  let consecutiveCrashes = 0;
+  let workerStartedAt = 0;
   const logStream = createSupervisorLogStream(options.logFile);
 
   const writeDurableChunk = (chunk: string | Buffer): void => {
@@ -168,6 +234,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       return;
     }
     exiting = true;
+    clearRestartTimer();
     Promise.resolve(options.onSupervisorExit?.())
       .catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
@@ -183,6 +250,13 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     if (forceKillTimer) {
       clearTimeout(forceKillTimer);
       forceKillTimer = null;
+    }
+  };
+
+  const clearRestartTimer = (): void => {
+    if (restartTimer) {
+      clearTimeout(restartTimer);
+      restartTimer = null;
     }
   };
 
@@ -229,6 +303,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     }
 
     const spawnSpec = resolveWorkerSpawnSpec?.(workerEntry) ?? null;
+    workerStartedAt = Date.now();
     writeLifecycleLog("Spawning worker", { workerEntry });
     if (spawnSpec) {
       child = spawn(spawnSpec.command, spawnSpec.args, {
@@ -319,14 +394,62 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
         restartOnCrash &&
         ((code !== 0 && code !== null) || (signal !== null && signal !== "SIGTERM"));
 
-      if (restarting || crashed) {
+      // A commanded restart is not a crash: it neither backs off nor counts
+      // against the crash budget.
+      if (restarting) {
         restarting = false;
-        log(
-          crashed
-            ? `Worker crashed (${exitDescriptor}). Restarting worker...`
-            : `Worker exited (${exitDescriptor}). Restarting worker...`,
-        );
+        log(`Worker exited (${exitDescriptor}). Restarting worker...`);
         spawnWorker();
+        return;
+      }
+
+      if (crashed) {
+        const uptimeMs = workerStartedAt > 0 ? Date.now() - workerStartedAt : 0;
+        if (uptimeMs >= restartPolicy.stableAfterMs) {
+          // The worker ran long enough to count as healthy, so this is a fresh
+          // fault rather than a continuing crash loop.
+          consecutiveCrashes = 0;
+        }
+        consecutiveCrashes += 1;
+
+        if (consecutiveCrashes > restartPolicy.maxAttempts) {
+          writeLifecycleLog("Worker crash budget exhausted", {
+            exit: exitDescriptor,
+            consecutiveCrashes,
+            maxAttempts: restartPolicy.maxAttempts,
+            uptimeMs,
+          });
+          log(
+            `Worker crashed (${exitDescriptor}) ${consecutiveCrashes} times in a row ` +
+              `(limit ${restartPolicy.maxAttempts}). Supervisor giving up.`,
+          );
+          exitSupervisor(1);
+          return;
+        }
+
+        const delayMs = computeRestartDelayMs(consecutiveCrashes, restartPolicy);
+        writeLifecycleLog("Scheduling worker restart after crash", {
+          exit: exitDescriptor,
+          consecutiveCrashes,
+          maxAttempts: restartPolicy.maxAttempts,
+          delayMs,
+          uptimeMs,
+        });
+        log(
+          `Worker crashed (${exitDescriptor}). Restarting worker in ${delayMs}ms ` +
+            `(attempt ${consecutiveCrashes}/${restartPolicy.maxAttempts})...`,
+        );
+        clearRestartTimer();
+        // Deliberately not unref'd: while a restart is pending this timer is the
+        // only thing keeping the supervisor alive, and dropping it would exit
+        // the supervisor silently instead of restarting the worker.
+        restartTimer = setTimeout(() => {
+          restartTimer = null;
+          if (shuttingDown || exiting) {
+            return;
+          }
+          spawnWorker();
+        }, delayMs);
         return;
       }
 
@@ -388,6 +511,15 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     restarting = false;
     writeLifecycleLog("Supervisor shutdown requested", { reason });
     log(`${reason}. Stopping worker...`);
+    if (restartTimer) {
+      // A crash restart is pending, so `child` still references an already-exited
+      // process and there is nothing to signal. Exit through exitSupervisor so
+      // the pid lock is still released.
+      clearRestartTimer();
+      writeLifecycleLog("Cancelled pending worker restart", { reason });
+      exitSupervisor(0);
+      return;
+    }
     if (!child) {
       exitSupervisor(0);
       return;
