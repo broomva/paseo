@@ -254,6 +254,35 @@ export function resolveFreshWorkerHealth(
   return health;
 }
 
+/**
+ * How long the worker has been blocked, as of `now`.
+ *
+ * `sinceLastAckMs` is frozen at the instant the supervisor recorded the
+ * transition, and the supervisor writes only on transitions — so rendering it
+ * directly would report the same duration however long the stall has since
+ * continued. The elapsed time since the record was written has to be added
+ * back. Clock skew is clamped rather than allowed to shorten the answer.
+ */
+export function resolveBlockedForMs(health: LocalDaemonWorkerHealth, now: number): number {
+  const observedAt = Date.parse(health.observedAt);
+  if (Number.isNaN(observedAt)) {
+    return health.sinceLastAckMs;
+  }
+  return health.sinceLastAckMs + Math.max(0, now - observedAt);
+}
+
+/**
+ * The operator-facing explanation for a stalled daemon. Extracted so the
+ * sentence itself is covered by tests rather than only the values behind it.
+ */
+export function describeStalledDaemon(health: LocalDaemonWorkerHealth, now: number): string {
+  return (
+    `Local daemon is alive but its event loop has been blocked for ` +
+    `${resolveBlockedForMs(health, now)}ms (reported by the supervisor). ` +
+    `It is busy, not dead — restarting it will drop in-flight work.`
+  );
+}
+
 async function probeDaemonOverWebsocket(args: {
   host: string;
   state: ReturnType<typeof resolveLocalDaemonState>;
@@ -281,10 +310,7 @@ async function probeDaemonOverWebsocket(args: {
         return {
           connectedDaemon: "unreachable",
           localDaemonOverride: "stalled",
-          note:
-            `Local daemon is alive but its event loop has been blocked for ` +
-            `${supervisorHealth.sinceLastAckMs}ms (reported by the supervisor). ` +
-            `It is busy, not dead — restarting it will drop in-flight work.`,
+          note: describeStalledDaemon(supervisorHealth, Date.now()),
         };
       }
       return {
