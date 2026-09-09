@@ -24,6 +24,30 @@ const DEFAULT_RESTART_MAX_ATTEMPTS = 10;
 /** Uptime after which a worker is considered healthy and the crash counter resets. */
 const DEFAULT_RESTART_STABLE_AFTER_MS = 60_000;
 
+/**
+ * How long the worker may go without acknowledging a heartbeat before the
+ * supervisor reports it as stalled.
+ *
+ * The supervisor is the only observer that can tell a *stalled* worker from a
+ * *dead* one: it owns the child handle, so process death arrives as an `exit`
+ * event regardless of how blocked the worker's event loop is. Any in-band probe
+ * (a websocket handshake, an HTTP health route) is served by that same event
+ * loop, so it fails identically in both cases — which is how a merely busy
+ * daemon gets misread as dead and restarted.
+ */
+const DEFAULT_WORKER_STALL_THRESHOLD_MS = 5_000;
+
+export type WorkerHealthState = "healthy" | "stalled";
+
+export interface WorkerHealth {
+  state: WorkerHealthState;
+  /** Time since the worker last acknowledged a heartbeat. */
+  sinceLastAckMs: number;
+  /** Round-trip time of the most recent acknowledged heartbeat. */
+  lastRoundTripMs: number | null;
+  workerPid: number | null;
+}
+
 export interface SupervisorRestartPolicy {
   initialDelayMs?: number;
   maxDelayMs?: number;
@@ -90,6 +114,8 @@ type WorkerLifecycleMessage =
 
 interface SupervisorHeartbeatMessage {
   type: "paseo:supervisor-heartbeat";
+  seq: number;
+  sentAt: number;
 }
 
 interface SupervisorGracefulShutdownMessage {
@@ -113,6 +139,10 @@ interface SupervisorOptions {
   restartOnCrash?: boolean;
   /** Backoff and give-up policy applied to crash restarts only. */
   restartPolicy?: SupervisorRestartPolicy;
+  /** Heartbeat silence after which the worker is reported stalled. */
+  stallThresholdMs?: number;
+  /** Called when the worker transitions between healthy and stalled. */
+  onWorkerHealthChange?: (health: WorkerHealth) => Promise<void> | void;
   onSupervisorExit?: () => Promise<void> | void;
   logFile?: SupervisorLogFileOptions;
 }
@@ -154,6 +184,25 @@ function parseLifecycleMessage(msg: unknown): WorkerLifecycleMessage | null {
   return null;
 }
 
+/**
+ * Returns the `sentAt` carried by a worker heartbeat acknowledgement, or null if
+ * the message is not one. Malformed acks are ignored rather than trusted, so a
+ * worker cannot mask a stall by replying with garbage.
+ */
+export function parseHeartbeatAck(msg: unknown): number | null {
+  if (typeof msg !== "object" || msg === null || !("type" in msg)) {
+    return null;
+  }
+  if ((msg as { type?: unknown }).type !== "paseo:worker-heartbeat-ack") {
+    return null;
+  }
+  const sentAt = (msg as { sentAt?: unknown }).sentAt;
+  if (typeof sentAt !== "number" || !Number.isFinite(sentAt)) {
+    return null;
+  }
+  return sentAt;
+}
+
 function toRotatingFileStreamSize(size: string): string {
   const trimmed = size.trim();
   const match = trimmed.match(/^(\d+)\s*([bBkKmMgG])?$/);
@@ -187,6 +236,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
   const resolveWorkerSpawnSpec = options.resolveWorkerSpawnSpec;
 
   const restartPolicy = resolveRestartPolicy(options.restartPolicy);
+  const stallThresholdMs = options.stallThresholdMs ?? DEFAULT_WORKER_STALL_THRESHOLD_MS;
 
   let child: ChildProcess | null = null;
   let restarting = false;
@@ -319,9 +369,62 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     }
 
     const currentChild = child;
+
+    // Per-generation heartbeat state: a respawned worker starts from scratch.
+    let heartbeatSeq = 0;
+    let lastAckAt = Date.now();
+    let lastRoundTripMs: number | null = null;
+    let hasAcked = false;
+    let stalled = false;
+    // Send time of the oldest heartbeat the worker has not answered yet, or null
+    // when everything sent so far has been acknowledged. Stalls are measured
+    // against this rather than against a raw "time since last ack" gap: the
+    // latter is never smaller than the heartbeat interval, so any threshold
+    // below that interval would report a permanently healthy worker as stalled.
+    let oldestUnackedSentAt: number | null = null;
+
+    const reportHealth = (state: WorkerHealthState, sinceLastAckMs: number): void => {
+      const health: WorkerHealth = {
+        state,
+        sinceLastAckMs,
+        lastRoundTripMs,
+        workerPid: currentChild.pid ?? null,
+      };
+      Promise.resolve(options.onWorkerHealthChange?.(health)).catch((error) => {
+        writeLifecycleLog("Worker health change handler failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    };
+
+    const noteHeartbeatAck = (sentAt: number): void => {
+      const now = Date.now();
+      lastAckAt = now;
+      lastRoundTripMs = Math.max(0, now - sentAt);
+      hasAcked = true;
+      oldestUnackedSentAt = null;
+      if (stalled) {
+        stalled = false;
+        writeLifecycleLog("Worker event loop recovered", {
+          workerPid: currentChild.pid ?? null,
+          roundTripMs: lastRoundTripMs,
+        });
+        log(`Worker event loop recovered after ${lastRoundTripMs}ms.`);
+        reportHealth("healthy", 0);
+      }
+    };
+
     const heartbeat = setInterval(() => {
-      const message: SupervisorHeartbeatMessage = { type: "paseo:supervisor-heartbeat" };
       if (currentChild.connected) {
+        heartbeatSeq += 1;
+        const message: SupervisorHeartbeatMessage = {
+          type: "paseo:supervisor-heartbeat",
+          seq: heartbeatSeq,
+          sentAt: Date.now(),
+        };
+        if (oldestUnackedSentAt === null) {
+          oldestUnackedSentAt = message.sentAt;
+        }
         currentChild.send?.(message, (error) => {
           if (error) {
             writeLifecycleLog("Worker heartbeat IPC send failed", {
@@ -331,6 +434,29 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
         });
       } else {
         writeLifecycleLog("Worker heartbeat skipped because IPC channel is disconnected");
+      }
+
+      // Only workers that have acknowledged at least once are eligible to be
+      // reported stalled. A worker build that predates the ack never replies,
+      // and reporting it as permanently stalled would be worse than silence.
+      if (!hasAcked || stalled || oldestUnackedSentAt === null) {
+        return;
+      }
+      const unansweredForMs = Date.now() - oldestUnackedSentAt;
+      if (unansweredForMs > stallThresholdMs) {
+        stalled = true;
+        const sinceLastAckMs = Date.now() - lastAckAt;
+        writeLifecycleLog("Worker event loop stalled", {
+          workerPid: currentChild.pid ?? null,
+          unansweredForMs,
+          sinceLastAckMs,
+          stallThresholdMs,
+        });
+        log(
+          `Worker has not acknowledged a heartbeat for ${unansweredForMs}ms. ` +
+            `The process is alive; its event loop is blocked.`,
+        );
+        reportHealth("stalled", sinceLastAckMs);
       }
     }, WORKER_HEARTBEAT_INTERVAL_MS);
     heartbeat.unref();
@@ -350,6 +476,12 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     });
 
     child.on("message", (msg: unknown) => {
+      const ackSentAt = parseHeartbeatAck(msg);
+      if (ackSentAt !== null) {
+        noteHeartbeatAck(ackSentAt);
+        return;
+      }
+
       const lifecycleMessage = parseLifecycleMessage(msg);
       if (!lifecycleMessage) {
         return;
