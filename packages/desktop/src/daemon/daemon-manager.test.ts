@@ -460,6 +460,23 @@ describe("daemon-manager commands", () => {
     );
   });
 
+  it("treats a stalled daemon as alive: start neither spawns nor reclaims", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue({
+      localDaemon: "stalled",
+      connectedDaemon: "unreachable",
+      serverId: "srv-1",
+      pid: 7675,
+      listen: "127.0.0.1:6767",
+      desktopManaged: true,
+    });
+
+    const status = await createDaemonCommandHandlers().start_desktop_daemon();
+
+    expect(status).toEqual(expect.objectContaining({ status: "running", pid: 7675 }));
+    expect(mocks.spawnProcess).not.toHaveBeenCalled();
+    expect(mocks.createNodeEntrypointInvocation).not.toHaveBeenCalled();
+  });
+
   it("passes stale lock reclaim only after a live desktop daemon is confirmed unresponsive", async () => {
     mocks.runExternalCliJsonCommand.mockResolvedValue({
       localDaemon: "unresponsive",
