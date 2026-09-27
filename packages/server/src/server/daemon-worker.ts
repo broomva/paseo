@@ -274,6 +274,14 @@ async function main() {
       const type = (message as { type?: unknown }).type;
       if (type === "paseo:supervisor-heartbeat") {
         lastSupervisorHeartbeatAt = Date.now();
+        // Echo the supervisor's send time back. The supervisor uses the
+        // round-trip to distinguish a blocked event loop from a dead process —
+        // a distinction no in-band probe can make, because any such probe is
+        // served by this same event loop.
+        const sentAt = (message as { sentAt?: unknown }).sentAt;
+        if (typeof sentAt === "number" && process.connected) {
+          process.send?.({ type: "paseo:worker-heartbeat-ack", sentAt });
+        }
         return;
       }
       if (type === "paseo:graceful-shutdown") {

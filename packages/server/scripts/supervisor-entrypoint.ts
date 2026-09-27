@@ -6,10 +6,10 @@ import {
   PidLockError,
   releasePidLock,
   startPidLockHeartbeat,
-  updatePidLock,
 } from "../src/server/pid-lock.js";
 import { resolvePaseoHome } from "../src/server/paseo-home.js";
 import { loadPersistedConfig } from "../src/server/persisted-config.js";
+import { createPidLockHealthPublisher } from "./pid-lock-health-publisher.js";
 import { runSupervisor } from "./supervisor.js";
 import { resolveSupervisorLogFile } from "./supervisor-log-config.js";
 import { applySherpaLoaderEnv } from "../src/server/speech/providers/local/sherpa/sherpa-runtime-env.js";
@@ -150,6 +150,8 @@ async function main(): Promise<void> {
     });
   };
 
+  const healthPublisher = createPidLockHealthPublisher(paseoHome, process.pid);
+
   const supervisor = runSupervisor({
     name: "DaemonRunner",
     startupMessage: "Starting daemon worker (IPC restart and crash restart enabled)",
@@ -174,9 +176,9 @@ async function main(): Promise<void> {
       : undefined,
     restartOnCrash: true,
     logFile: supervisorLogFile,
-    onWorkerReady: async ({ listen }) => {
-      await updatePidLock(paseoHome, { listen }, { ownerPid: process.pid });
-    },
+    onWorkerReady: healthPublisher.onWorkerReady,
+    onWorkerExit: healthPublisher.onWorkerExit,
+    onWorkerHealthChange: healthPublisher.onWorkerHealthChange,
     onSupervisorExit: releaseLock,
   });
   requestSupervisorShutdown = supervisor.requestShutdown;

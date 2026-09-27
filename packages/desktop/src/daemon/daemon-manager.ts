@@ -223,7 +223,10 @@ function statusFromDaemonProbe(
 ): DesktopDaemonStatus {
   const local = typeof payload.localDaemon === "string" ? payload.localDaemon : "stopped";
   const reachable = payload.connectedDaemon === "reachable";
-  const processAlive = local === "running";
+  // "stalled" is a live daemon whose event loop is busy (the supervisor's
+  // verdict): it must read as alive, never as stopped or reclaimable, or
+  // `start` would launch a second daemon over the one still holding the lock.
+  const processAlive = local === "running" || local === "stalled";
   const stalledProcess = local === "unresponsive";
   let status: DesktopDaemonState = "stopped";
   if (reachable || processAlive) {

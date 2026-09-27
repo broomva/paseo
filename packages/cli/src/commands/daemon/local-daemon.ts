@@ -19,6 +19,14 @@ export interface DaemonStartOptions {
   hostnames?: string;
 }
 
+/** Supervisor-observed worker health, as published in the PID lock file. */
+export interface LocalDaemonWorkerHealth {
+  state: "healthy" | "stalled";
+  observedAt: string;
+  sinceLastAckMs: number;
+  lastRoundTripMs: number | null;
+}
+
 export interface LocalDaemonPidInfo {
   pid: number;
   startedAt?: string;
@@ -26,6 +34,26 @@ export interface LocalDaemonPidInfo {
   uid?: number;
   listen?: string;
   desktopManaged?: boolean;
+  workerHealth?: LocalDaemonWorkerHealth;
+}
+
+function parseWorkerHealth(raw: unknown): LocalDaemonWorkerHealth | undefined {
+  if (typeof raw !== "object" || raw === null) {
+    return undefined;
+  }
+  const candidate = raw as Record<string, unknown>;
+  const state = candidate.state;
+  const observedAt = candidate.observedAt;
+  if ((state !== "healthy" && state !== "stalled") || typeof observedAt !== "string") {
+    return undefined;
+  }
+  return {
+    state,
+    observedAt,
+    sinceLastAckMs: typeof candidate.sinceLastAckMs === "number" ? candidate.sinceLastAckMs : 0,
+    lastRoundTripMs:
+      typeof candidate.lastRoundTripMs === "number" ? candidate.lastRoundTripMs : null,
+  };
 }
 
 export interface LocalDaemonState {
@@ -259,6 +287,7 @@ function readPidFile(pidPath: string): LocalDaemonPidInfo | null {
       uid: typeof parsed.uid === "number" ? parsed.uid : undefined,
       listen: resolveListenField(parsed.listen, parsed.sockPath),
       desktopManaged: parsed.desktopManaged === true ? true : undefined,
+      workerHealth: parseWorkerHealth(parsed.workerHealth),
     };
   } catch {
     return null;

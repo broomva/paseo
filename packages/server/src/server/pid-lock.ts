@@ -5,6 +5,22 @@ import { join } from "node:path";
 import { hostname } from "node:os";
 import { z } from "zod";
 
+/**
+ * Supervisor-observed worker health.
+ *
+ * This is written by the supervisor process, which is why it is trustworthy
+ * when the worker itself cannot answer: a blocked worker event loop cannot
+ * falsify it, and it is the only signal that separates a stalled daemon from a
+ * dead one. `observedAt` exists so readers can ignore a verdict left behind by
+ * a supervisor that has since died.
+ */
+export const workerHealthSchema = z.object({
+  state: z.enum(["healthy", "stalled"]),
+  observedAt: z.string(),
+  sinceLastAckMs: z.number(),
+  lastRoundTripMs: z.number().nullable(),
+});
+
 export const pidLockInfoSchema = z.object({
   pid: z.number(),
   startedAt: z.string(),
@@ -13,7 +29,10 @@ export const pidLockInfoSchema = z.object({
   listen: z.string().nullable(),
   desktopManaged: z.boolean().optional(),
   heartbeat: z.literal(true).optional(),
+  workerHealth: workerHealthSchema.optional(),
 });
+
+export interface WorkerHealthRecord extends z.infer<typeof workerHealthSchema> {}
 
 export interface PidLockInfo extends z.infer<typeof pidLockInfoSchema> {}
 
@@ -298,7 +317,7 @@ export function startPidLockHeartbeat(
 
 export async function updatePidLock(
   paseoHome: string,
-  patch: { listen: string },
+  patch: Partial<Pick<PidLockInfo, "listen" | "workerHealth">>,
   options?: { ownerPid?: number },
 ): Promise<void> {
   const pidPath = getPidFilePath(paseoHome);
