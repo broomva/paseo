@@ -143,6 +143,12 @@ interface SupervisorOptions {
   stallThresholdMs?: number;
   /** Called when the worker transitions between healthy and stalled. */
   onWorkerHealthChange?: (health: WorkerHealth) => Promise<void> | void;
+  /**
+   * Called when a worker exits outside shutdown. A health verdict about a worker
+   * that no longer exists must not outlive it: a published "stalled" would keep
+   * telling readers "busy, not dead" through the whole restart backoff.
+   */
+  onWorkerExit?: () => Promise<void> | void;
   onSupervisorExit?: () => Promise<void> | void;
   logFile?: SupervisorLogFileOptions;
 }
@@ -527,6 +533,12 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
         exitSupervisor(0);
         return;
       }
+
+      Promise.resolve(options.onWorkerExit?.()).catch((error) => {
+        writeLifecycleLog("Worker exit handler failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
 
       const crashed =
         restartOnCrash &&

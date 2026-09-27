@@ -14,10 +14,11 @@ async function runSupervisorFixture(options: {
   workerSource: string;
   stallThresholdMs: number;
   timeoutMs?: number;
-}): Promise<{ code: number | null; log: string; health: WorkerHealth[] }> {
+}): Promise<{ code: number | null; log: string; health: WorkerHealth[]; exits: number }> {
   const tempDir = await mkdtemp(path.join(tmpdir(), "paseo-supervisor-health-"));
   const logPath = path.join(tempDir, "daemon.log");
   const healthPath = path.join(tempDir, "health.jsonl");
+  const exitPath = path.join(tempDir, "exits.txt");
   const workerPath = path.join(tempDir, "worker.mjs");
   const runnerPath = path.join(tempDir, "runner.mjs");
 
@@ -39,6 +40,9 @@ async function runSupervisorFixture(options: {
         stallThresholdMs: ${JSON.stringify(options.stallThresholdMs)},
         onWorkerHealthChange: (health) => {
           appendFileSync(${JSON.stringify(healthPath)}, JSON.stringify(health) + "\\n");
+        },
+        onWorkerExit: () => {
+          appendFileSync(${JSON.stringify(exitPath)}, "exit\\n");
         },
         logFile: {
           path: ${JSON.stringify(logPath)},
@@ -78,7 +82,10 @@ async function runSupervisorFixture(options: {
         .filter((line) => line.trim().length > 0)
         .map((line) => JSON.parse(line) as WorkerHealth)
     : [];
-  return { code, log, health };
+  const exits = existsSync(exitPath)
+    ? (await readFile(exitPath, "utf8")).split("\n").filter((line) => line.trim().length > 0).length
+    : 0;
+  return { code, log, health, exits };
 }
 
 /** Worker that acknowledges heartbeats, i.e. behaves like a current daemon. */
@@ -140,6 +147,26 @@ describe("supervisor worker health", () => {
     const stalledEntry = result.health[1];
     expect(stalledEntry.sinceLastAckMs).toBeGreaterThan(300);
     expect(stalledEntry.workerPid).toBeGreaterThan(0);
+  }, 40_000);
+
+  test("a worker that dies while stalled has its verdict cleared, not left as 'busy'", async () => {
+    // P20 round 1 on #1: after a stalled worker died, the published "stalled"
+    // verdict survived, so `paseo status` kept saying "busy, not dead" through
+    // the restart backoff. The exit must be reported so the verdict is cleared.
+    const result = await runSupervisorFixture({
+      stallThresholdMs: 300,
+      workerSource: `
+        ${ACKING_WORKER_PRELUDE}
+        setTimeout(() => {
+          const until = Date.now() + 2500;
+          while (Date.now() < until) {}
+          process.exit(1); // dies without ever recovering
+        }, 1500);
+      `,
+      timeoutMs: 25_000,
+    });
+    expect(result.health.map((entry) => entry.state)).toEqual(["healthy", "stalled"]);
+    expect(result.exits).toBe(1);
   }, 40_000);
 
   test("never reports a stall for a worker that does not implement the ack", async () => {

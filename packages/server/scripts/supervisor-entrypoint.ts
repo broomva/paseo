@@ -150,6 +150,15 @@ async function main(): Promise<void> {
     });
   };
 
+  // updatePidLock is read-modify-write on one file; the ready, health and exit
+  // writes can overlap, so they go through one chain or an update is lost.
+  let lockChain: Promise<void> = Promise.resolve();
+  const serializedLockUpdate = (patch: Parameters<typeof updatePidLock>[1]): Promise<void> => {
+    const run = lockChain.then(() => updatePidLock(paseoHome, patch, { ownerPid: process.pid }));
+    lockChain = run.catch(() => {});
+    return run;
+  };
+
   const supervisor = runSupervisor({
     name: "DaemonRunner",
     startupMessage: "Starting daemon worker (IPC restart and crash restart enabled)",
@@ -175,7 +184,17 @@ async function main(): Promise<void> {
     restartOnCrash: true,
     logFile: supervisorLogFile,
     onWorkerReady: async ({ listen }) => {
-      await updatePidLock(paseoHome, { listen }, { ownerPid: process.pid });
+      await serializedLockUpdate({ listen });
+    },
+    onWorkerExit: async () => {
+      // Clear the verdict: the worker it described is gone. Readers then fall
+      // back to probing instead of reporting a dead worker as merely busy.
+      try {
+        await serializedLockUpdate({ workerHealth: undefined });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`Failed to clear worker health: ${message}\n`);
+      }
     },
     onWorkerHealthChange: async (health) => {
       // Publish the supervisor's verdict where any out-of-process reader (the
@@ -183,18 +202,14 @@ async function main(): Promise<void> {
       // event loop is exactly what is in question. Only transitions are written,
       // so this is a rare write, not a per-second one.
       try {
-        await updatePidLock(
-          paseoHome,
-          {
-            workerHealth: {
-              state: health.state,
-              observedAt: new Date().toISOString(),
-              sinceLastAckMs: health.sinceLastAckMs,
-              lastRoundTripMs: health.lastRoundTripMs,
-            },
+        await serializedLockUpdate({
+          workerHealth: {
+            state: health.state,
+            observedAt: new Date().toISOString(),
+            sinceLastAckMs: health.sinceLastAckMs,
+            lastRoundTripMs: health.lastRoundTripMs,
           },
-          { ownerPid: process.pid },
-        );
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         process.stderr.write(`Failed to publish worker health: ${message}\n`);
