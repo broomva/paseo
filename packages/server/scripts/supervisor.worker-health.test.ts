@@ -13,6 +13,7 @@ const supervisorPath = fileURLToPath(new URL("./supervisor.ts", import.meta.url)
 async function runSupervisorFixture(options: {
   workerSource: string;
   stallThresholdMs: number;
+  stalledRefreshMs?: number;
   timeoutMs?: number;
 }): Promise<{ code: number | null; log: string; health: WorkerHealth[]; exits: number }> {
   const tempDir = await mkdtemp(path.join(tmpdir(), "paseo-supervisor-health-"));
@@ -38,6 +39,7 @@ async function runSupervisorFixture(options: {
         workerExecArgv: [],
         restartOnCrash: false,
         stallThresholdMs: ${JSON.stringify(options.stallThresholdMs)},
+        ${options.stalledRefreshMs === undefined ? "" : `stalledRefreshMs: ${JSON.stringify(options.stalledRefreshMs)},`}
         onWorkerHealthChange: (health) => {
           appendFileSync(${JSON.stringify(healthPath)}, JSON.stringify(health) + "\\n");
         },
@@ -148,6 +150,29 @@ describe("supervisor worker health", () => {
     expect(stalledEntry.sinceLastAckMs).toBeGreaterThan(300);
     expect(stalledEntry.workerPid).toBeGreaterThan(0);
   }, 40_000);
+
+  test("a long stall keeps its verdict fresh instead of aging out of the trust window", async () => {
+    // Round-2 review: the supervisor wrote only on transitions, so a stall
+    // longer than the CLI's trust window read as "unresponsive" — the exact
+    // misreading this PR removes. While stalled, the verdict is re-published.
+    const result = await runSupervisorFixture({
+      stallThresholdMs: 300,
+      stalledRefreshMs: 1000,
+      workerSource: `
+        ${ACKING_WORKER_PRELUDE}
+        setTimeout(() => {
+          const until = Date.now() + 4500;
+          while (Date.now() < until) {}
+        }, 1500);
+        setTimeout(() => process.exit(0), 7500);
+      `,
+      timeoutMs: 30_000,
+    });
+    const states = result.health.map((entry) => entry.state);
+    expect(states.filter((state) => state === "stalled").length).toBeGreaterThanOrEqual(2);
+    expect(states[0]).toBe("healthy");
+    expect(states.at(-1)).toBe("healthy");
+  }, 45_000);
 
   test("a worker that dies while stalled has its verdict cleared, not left as 'busy'", async () => {
     // P20 round 1 on #1: after a stalled worker died, the published "stalled"

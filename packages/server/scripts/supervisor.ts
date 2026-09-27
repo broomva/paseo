@@ -36,6 +36,8 @@ const DEFAULT_RESTART_STABLE_AFTER_MS = 60_000;
  * daemon gets misread as dead and restarted.
  */
 const DEFAULT_WORKER_STALL_THRESHOLD_MS = 5_000;
+// Well inside the CLI's 5-minute trust window for a published verdict.
+const DEFAULT_STALLED_REFRESH_MS = 60_000;
 
 export type WorkerHealthState = "healthy" | "stalled";
 
@@ -141,6 +143,12 @@ interface SupervisorOptions {
   restartPolicy?: SupervisorRestartPolicy;
   /** Heartbeat silence after which the worker is reported stalled. */
   stallThresholdMs?: number;
+  /**
+   * While a worker stays stalled, re-publish the verdict this often. Readers
+   * trust a verdict only for a bounded window (so a dead supervisor's last word
+   * expires); refreshing keeps a genuinely long stall inside that window.
+   */
+  stalledRefreshMs?: number;
   /** Called when the worker transitions between healthy and stalled. */
   onWorkerHealthChange?: (health: WorkerHealth) => Promise<void> | void;
   /**
@@ -243,6 +251,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
 
   const restartPolicy = resolveRestartPolicy(options.restartPolicy);
   const stallThresholdMs = options.stallThresholdMs ?? DEFAULT_WORKER_STALL_THRESHOLD_MS;
+  const stalledRefreshMs = options.stalledRefreshMs ?? DEFAULT_STALLED_REFRESH_MS;
 
   let child: ChildProcess | null = null;
   let restarting = false;
@@ -382,6 +391,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     let lastRoundTripMs: number | null = null;
     let hasAcked = false;
     let stalled = false;
+    let lastStalledReportAt = 0;
     // Send time of the oldest heartbeat the worker has not answered yet, or null
     // when everything sent so far has been acknowledged. Stalls are measured
     // against this rather than against a raw "time since last ack" gap: the
@@ -451,7 +461,16 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       // Only workers that have acknowledged at least once are eligible to be
       // reported stalled. A worker build that predates the ack never replies,
       // and reporting it as permanently stalled would be worse than silence.
-      if (!hasAcked || stalled || oldestUnackedSentAt === null) {
+      if (stalled) {
+        // Still stalled: refresh the verdict so a long stall does not age out
+        // of readers' trust window and read as "unresponsive".
+        if (Date.now() - lastStalledReportAt >= stalledRefreshMs) {
+          lastStalledReportAt = Date.now();
+          reportHealth("stalled", Date.now() - lastAckAt);
+        }
+        return;
+      }
+      if (!hasAcked || oldestUnackedSentAt === null) {
         return;
       }
       const unansweredForMs = Date.now() - oldestUnackedSentAt;
@@ -468,6 +487,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
           `Worker has not acknowledged a heartbeat for ${unansweredForMs}ms. ` +
             `The process is alive; its event loop is blocked.`,
         );
+        lastStalledReportAt = Date.now();
         reportHealth("stalled", sinceLastAckMs);
       }
     }, WORKER_HEARTBEAT_INTERVAL_MS);
