@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -45,5 +45,22 @@ describe("pid-lock health publisher (the production wiring)", () => {
     const info = await getPidLockInfo(home);
     expect(info?.listen).toBe("127.0.0.1:6767");
     expect(info?.workerHealth?.state).toBe("stalled");
+  });
+});
+
+describe("supervisor entrypoint wiring", () => {
+  // The publisher's behaviour is tested above against a real lock file; this
+  // pins the CALL SITE. Round-3 review: with only the publisher tested, deleting
+  // the entrypoint's `onWorkerExit` line left every test green while the stale
+  // "stalled" verdict came back in production. A source check is the cheapest
+  // guard that fails on exactly that deletion without booting a real daemon.
+  test("the entrypoint hands all three publisher hooks to runSupervisor", async () => {
+    const source = await readFile(new URL("./supervisor-entrypoint.ts", import.meta.url), "utf8");
+    const call = source.slice(source.indexOf("runSupervisor({"));
+    expect(call.length).toBeGreaterThan(0);
+    expect(source).toMatch(/createPidLockHealthPublisher\(paseoHome, process\.pid\)/);
+    for (const hook of ["onWorkerReady", "onWorkerExit", "onWorkerHealthChange"]) {
+      expect(call).toMatch(new RegExp(`${hook}:\\s*healthPublisher\\.${hook}\\b`));
+    }
   });
 });
