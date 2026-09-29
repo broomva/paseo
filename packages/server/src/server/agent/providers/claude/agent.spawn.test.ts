@@ -11,6 +11,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import * as spawnUtils from "../../../../utils/spawn.js";
 import { ClaudeAgentClient } from "./agent.js";
+import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
 import type { ClaudeQueryInput } from "./query.js";
 
 function createQueryMock(events: unknown[]): Query {
@@ -52,7 +53,9 @@ const INLINE_MCP_CONFIG = JSON.stringify({
   },
 });
 
-async function spawnClaudeWithInlineMcpConfig(): Promise<{ args: string[]; child: ChildProcess }> {
+async function spawnClaudeWithInlineMcpConfig(
+  runtimeSettings?: ProviderRuntimeSettings,
+): Promise<{ args: string[]; child: ChildProcess }> {
   let capturedOptions: Options | undefined;
   const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
     capturedOptions = options;
@@ -78,6 +81,7 @@ async function spawnClaudeWithInlineMcpConfig(): Promise<{ args: string[]; child
     logger: createTestLogger(),
     queryFactory,
     resolveBinary: async () => "/test/claude/bin",
+    runtimeSettings,
   });
   const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
   try {
@@ -184,4 +188,13 @@ describe("Claude spawn override", () => {
       child.emit("exit", 0, null);
     },
   );
+  test("keeps MCP configs inline for a replacement command, which may not share this host's files", async () => {
+    const { args, child } = await spawnClaudeWithInlineMcpConfig({
+      command: { mode: "replace", argv: ["/opt/claude-wrapper"] },
+    });
+
+    expect(args[args.indexOf("--mcp-config") + 1]).toBe(INLINE_MCP_CONFIG);
+
+    child.emit("exit", 0, null);
+  });
 });

@@ -101,7 +101,12 @@ function applyRuntimeSettingsToClaudeOptions(
     ...options,
     spawnClaudeCodeProcess: (spawnOptions) => {
       const resolved = resolveClaudeSpawnCommand(spawnOptions, runtimeSettings);
-      const mcpConfigFiles = moveInlineMcpConfigsToFiles(resolved.args);
+      // A replacement command can run Claude where this host's temp files do not
+      // exist (a container, a remote shell), so it keeps the inline form.
+      const mcpConfigFiles =
+        runtimeSettings?.command?.mode === "replace"
+          ? { args: resolved.args, cleanup: () => undefined }
+          : moveInlineMcpConfigsToFiles(resolved.args);
       // When the SDK passes a default JS runtime ("node"/"bun"), replace it with
       // process.execPath — the actual node binary running the daemon. This avoids
       // PATH lookup failures in the managed runtime bundle.

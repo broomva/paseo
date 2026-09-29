@@ -1196,50 +1196,56 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
-    if (this.pluginLifecycle && !config.internal) {
-      const request = await this.pluginLifecycle.before("agent.create", {
+    return this.revokeMcpCredentialOnFailedLaunch(resolvedAgentId, async () => {
+      if (this.pluginLifecycle && !config.internal) {
+        const request = await this.pluginLifecycle.before("agent.create", {
+          config,
+          env: options.env,
+        });
+        config = { ...request.config, internal: config.internal };
+        options = { ...options, env: request.env };
+      }
+      await this.deleteAgentState(resolvedAgentId);
+      const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
         config,
-        env: options.env,
+        resolvedAgentId,
+        options?.env,
+      );
+      this.requireEnabledProvider(storedConfig.provider);
+      const client = await this.requireAvailableClient({
+        provider: storedConfig.provider,
       });
-      config = { ...request.config, internal: config.internal };
-      options = { ...options, env: request.env };
-    }
-    await this.deleteAgentState(resolvedAgentId);
-    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
-      config,
-      resolvedAgentId,
-      options?.env,
-    );
-    this.requireEnabledProvider(storedConfig.provider);
-    const client = await this.requireAvailableClient({
-      provider: storedConfig.provider,
-    });
-    this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
-    const launchContext = await this.buildLaunchContext(
-      resolvedAgentId,
-      client,
-      storedConfig.cwd,
-      paseoToolPolicy,
-      options?.env,
-      { reason: "create", purpose: "interactive", workspaceId: options.workspaceId ?? null },
-    );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const createOptions = this.buildCreateSessionOptions(options);
-    const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
-    await this.requireExternalMcpSupport(session, storedConfig);
-    const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
-      labels: options.labels,
-      initialTitle: options.initialTitle,
-      workspaceId: options.workspaceId,
-      owner: options.owner,
-      historyPrimed: true,
-    });
-    if (!agent.internal) {
-      this.pluginLifecycle?.emit("agent.created", {
-        agent: describeHookAgent({ ...agent, title: agent.config.title }),
+      this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
+      const launchContext = await this.buildLaunchContext(
+        resolvedAgentId,
+        client,
+        storedConfig.cwd,
+        paseoToolPolicy,
+        options?.env,
+        { reason: "create", purpose: "interactive", workspaceId: options.workspaceId ?? null },
+      );
+      const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+      const createOptions = this.buildCreateSessionOptions(options);
+      const session = await client.createSession(
+        providerLaunchConfig,
+        launchContext,
+        createOptions,
+      );
+      await this.requireExternalMcpSupport(session, storedConfig);
+      const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
+        labels: options.labels,
+        initialTitle: options.initialTitle,
+        workspaceId: options.workspaceId,
+        owner: options.owner,
+        historyPrimed: true,
       });
-    }
-    return agent;
+      if (!agent.internal) {
+        this.pluginLifecycle?.emit("agent.created", {
+          agent: describeHookAgent({ ...agent, title: agent.config.title }),
+        });
+      }
+      return agent;
+    });
   }
 
   private buildCreateSessionOptions(options?: {
@@ -1290,48 +1296,50 @@ export class AgentManager {
       agentId ?? this.idFactory(),
       "resumeAgentFromPersistence",
     );
-    const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
-    const mergedConfig = {
-      ...metadata,
-      ...overrides,
-      provider: handle.provider,
-    } as AgentSessionConfig;
-    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
-      mergedConfig,
-      resolvedAgentId,
-    );
-
-    const client = this.requireClient(handle.provider);
-    const available = await client.isAvailable();
-    if (!available) {
-      throw new Error(
-        `Provider '${handle.provider}' is not available. Please ensure the CLI is installed.`,
+    return this.revokeMcpCredentialOnFailedLaunch(resolvedAgentId, async () => {
+      const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
+      const mergedConfig = {
+        ...metadata,
+        ...overrides,
+        provider: handle.provider,
+      } as AgentSessionConfig;
+      const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
+        mergedConfig,
+        resolvedAgentId,
       );
-    }
-    this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
-    const launchContext = await this.buildLaunchContext(
-      resolvedAgentId,
-      client,
-      storedConfig.cwd,
-      paseoToolPolicy,
-      undefined,
-      {
-        reason: "resume",
-        purpose: resumeOptions?.purpose ?? "interactive",
-        workspaceId: options?.workspaceId ?? null,
-      },
-    );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const session = await client.resumeSession(
-      handle,
-      providerLaunchConfig,
-      launchContext,
-      resumeOptions,
-    );
-    await this.requireExternalMcpSupport(session, storedConfig);
-    return this.registerSession(session, storedConfig, resolvedAgentId, {
-      ...options,
-      persistence: handle,
+
+      const client = this.requireClient(handle.provider);
+      const available = await client.isAvailable();
+      if (!available) {
+        throw new Error(
+          `Provider '${handle.provider}' is not available. Please ensure the CLI is installed.`,
+        );
+      }
+      this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
+      const launchContext = await this.buildLaunchContext(
+        resolvedAgentId,
+        client,
+        storedConfig.cwd,
+        paseoToolPolicy,
+        undefined,
+        {
+          reason: "resume",
+          purpose: resumeOptions?.purpose ?? "interactive",
+          workspaceId: options?.workspaceId ?? null,
+        },
+      );
+      const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+      const session = await client.resumeSession(
+        handle,
+        providerLaunchConfig,
+        launchContext,
+        resumeOptions,
+      );
+      await this.requireExternalMcpSupport(session, storedConfig);
+      return this.registerSession(session, storedConfig, resolvedAgentId, {
+        ...options,
+        persistence: handle,
+      });
     });
   }
 
@@ -1354,66 +1362,73 @@ export class AgentManager {
   }): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
-    this.requireEnabledProvider(input.provider);
+    return this.revokeMcpCredentialOnFailedLaunch(resolvedAgentId, async () => {
+      this.requireEnabledProvider(input.provider);
 
-    const client = await this.requireAvailableClient({ provider: input.provider });
-    if (!client.importSession) {
-      throw new Error(`Provider '${input.provider}' does not support importing sessions`);
-    }
+      const client = await this.requireAvailableClient({ provider: input.provider });
+      if (!client.importSession) {
+        throw new Error(`Provider '${input.provider}' does not support importing sessions`);
+      }
 
-    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
-      {
-        provider: input.provider,
-        cwd: input.cwd,
-      },
-      resolvedAgentId,
-    );
-    this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
-    const launchContext = await this.buildLaunchContext(
-      resolvedAgentId,
-      client,
-      storedConfig.cwd,
-      paseoToolPolicy,
-      undefined,
-      { reason: "import", purpose: "interactive", workspaceId: input.workspaceId },
-    );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const imported = await client.importSession(
-      {
-        providerHandleId: input.providerHandleId,
-        cwd: input.cwd,
-      },
-      { config: providerLaunchConfig, storedConfig, launchContext },
-    );
-    let handedToRegistration = false;
-    try {
-      const importedConfig = await this.normalizeConfig(
-        stripInternalPaseoMcpServer(imported.config),
+      const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
+        {
+          provider: input.provider,
+          cwd: input.cwd,
+        },
+        resolvedAgentId,
       );
-      const timelineRows = buildImportedTimelineRows(imported.timeline);
-      const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
+      this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
+      const launchContext = await this.buildLaunchContext(
+        resolvedAgentId,
+        client,
+        storedConfig.cwd,
+        paseoToolPolicy,
+        undefined,
+        { reason: "import", purpose: "interactive", workspaceId: input.workspaceId },
+      );
+      const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+      const imported = await client.importSession(
+        {
+          providerHandleId: input.providerHandleId,
+          cwd: input.cwd,
+        },
+        { config: providerLaunchConfig, storedConfig, launchContext },
+      );
+      let handedToRegistration = false;
+      try {
+        const importedConfig = await this.normalizeConfig(
+          stripInternalPaseoMcpServer(imported.config),
+        );
+        const timelineRows = buildImportedTimelineRows(imported.timeline);
+        const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
 
-      handedToRegistration = true;
-      const agent = await this.registerSession(imported.session, importedConfig, resolvedAgentId, {
-        labels: input.labels,
-        workspaceId: input.workspaceId,
-        timelineRows,
-        timelineNextSeq: timelineRows.length + 1,
-        persistence: imported.persistence,
-        historyPrimed: true,
-        initialTitle,
-        publishWhenReady: true,
-      });
-      for (const event of imported.providerSubagentEvents ?? []) {
-        const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-        this.dispatch({ type: "provider_subagent", event: update });
+        handedToRegistration = true;
+        const agent = await this.registerSession(
+          imported.session,
+          importedConfig,
+          resolvedAgentId,
+          {
+            labels: input.labels,
+            workspaceId: input.workspaceId,
+            timelineRows,
+            timelineNextSeq: timelineRows.length + 1,
+            persistence: imported.persistence,
+            historyPrimed: true,
+            initialTitle,
+            publishWhenReady: true,
+          },
+        );
+        for (const event of imported.providerSubagentEvents ?? []) {
+          const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
+          this.dispatch({ type: "provider_subagent", event: update });
+        }
+        return agent;
+      } finally {
+        if (!handedToRegistration) {
+          await this.closeUnregisteredSession(imported.session);
+        }
       }
-      return agent;
-    } finally {
-      if (!handedToRegistration) {
-        await this.closeUnregisteredSession(imported.session);
-      }
-    }
+    });
   }
 
   // Hot-reload an active agent session with config overrides. By default the
@@ -3544,6 +3559,25 @@ export class AgentManager {
       finalizedForegroundTurnIds: new Set(),
       unsubscribeSession: null,
     };
+  }
+
+  /**
+   * Runs a launch that issues the agent's MCP credential, revoking it when the
+   * agent never registers, so a provider process that failed to start keeps no
+   * working credential. An agent that was already live keeps its credential.
+   */
+  private async revokeMcpCredentialOnFailedLaunch<T>(
+    agentId: string,
+    launch: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await launch();
+    } catch (error) {
+      if (!this.agents.has(agentId)) {
+        this.mcpCredentials.revoke(agentId);
+      }
+      throw error;
+    }
   }
 
   private discardRetainedAgentState(agentId: string): void {

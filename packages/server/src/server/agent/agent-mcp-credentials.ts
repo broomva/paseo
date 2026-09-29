@@ -3,11 +3,15 @@ import { createHash, randomBytes } from "node:crypto";
 /**
  * Bearer credentials for the Agent MCP endpoint (/mcp/agents), one per agent.
  *
- * The endpoint derives the calling agent from the credential, so an agent can
- * only act as itself: holding one agent's credential grants nothing about any
- * other agent. Credentials live in daemon memory only, so they last at most one
- * daemon run, and AgentManager revokes them when the agent closes or is
- * archived.
+ * The endpoint derives the calling agent from the credential, so a request can
+ * only act as the agent whose credential it presents, and a leaked credential is
+ * limited to that agent until it closes. Credentials live in daemon memory
+ * only, so they last at most one daemon run, and AgentManager revokes them when
+ * the agent closes or is archived.
+ *
+ * This is not isolation between agents: they run as the same OS user and can
+ * read each other's processes and files, and an agent that inherits
+ * PASEO_PASSWORD authenticates as the owner.
  */
 export class AgentMcpCredentials {
   private readonly tokenByAgentId = new Map<string, string>();

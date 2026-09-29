@@ -3197,6 +3197,36 @@ test("closing or archiving an agent revokes its MCP credential", async () => {
   rmSync(workdir, { recursive: true, force: true });
 });
 
+test("a launch that fails before the agent registers revokes its MCP credential", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-mcp-credential-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class FailingClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.createdConfigs.push(config);
+      throw new Error("provider failed to start");
+    }
+  }
+
+  const client = new FailingClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+  });
+
+  await expect(
+    manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    }),
+  ).rejects.toThrow("provider failed to start");
+
+  expect(manager.resolveMcpCredential(readPaseoMcpCredential(client.createdConfigs[0]))).toBeNull();
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
 test("reloading an agent keeps its MCP credential", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-mcp-credential-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
