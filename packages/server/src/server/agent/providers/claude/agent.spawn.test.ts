@@ -136,7 +136,8 @@ describe("Claude spawn override", () => {
         },
       ]);
     });
-    const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(createChildProcessStub());
+    const child = createChildProcessStub();
+    const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(child);
     const client = new ClaudeAgentClient({
       logger: createTestLogger(),
       queryFactory,
@@ -164,6 +165,7 @@ describe("Claude spawn override", () => {
     expect(claudeSpawnCall).toBeDefined();
     const spawnOptions = claudeSpawnCall?.[2];
     expect(spawnOptions?.shell).toBe(false);
+    child.emit("exit", 0, null);
   });
   test("passes MCP configs to Claude Code by file path, keeping credentials out of argv", async () => {
     const { args, child } = await spawnClaudeWithInlineMcpConfig();
