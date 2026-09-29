@@ -1,13 +1,15 @@
 import { describe, expect, test } from "vitest";
 
+import { AgentMcpCredentials } from "./agent/agent-mcp-credentials.js";
 import {
+  authenticateAgentMcpRequest,
   extractHttpBearerToken,
   extractWsBearerProtocol,
   extractWsBearerToken,
   hashDaemonPassword,
-  isAgentMcpRequestAuthorized,
   isBearerTokenValidAsync,
   isBearerTokenValid,
+  resolveAgentMcpCaller,
   shouldBypassBearerAuth,
 } from "./auth.js";
 
@@ -62,8 +64,8 @@ describe("daemon bearer validator", () => {
     expect(shouldBypassBearerAuth("GET", "/api/health")).toBe(true);
     // Guarded by its own single-use download token, not the daemon password.
     expect(shouldBypassBearerAuth("GET", "/api/files/download")).toBe(true);
-    // Guarded by its own per-daemon-run capability token (see
-    // isAgentMcpRequestAuthorized), not the daemon password.
+    // Guarded by per-agent credentials (see authenticateAgentMcpRequest), with the
+    // daemon password as the owner fallback.
     expect(shouldBypassBearerAuth("POST", "/mcp/agents")).toBe(true);
     // Everything else stays behind the daemon password.
     expect(shouldBypassBearerAuth("GET", "/api/status")).toBe(false);
@@ -71,53 +73,118 @@ describe("daemon bearer validator", () => {
   });
 });
 
-describe("agent MCP request authorizer", () => {
-  const CAPABILITY_TOKEN = "cap-token-abc123";
+describe("agent MCP request authentication", () => {
+  function authenticate(input: {
+    credentials: AgentMcpCredentials;
+    password: string | undefined;
+    authorizationHeader: string | undefined;
+  }) {
+    return authenticateAgentMcpRequest({
+      password: input.password,
+      resolveAgentCredential: (token) => input.credentials.resolve(token),
+      authorizationHeader: input.authorizationHeader,
+    });
+  }
 
-  test("allows any request when no daemon password is configured", async () => {
-    expect(
-      await isAgentMcpRequestAuthorized({
-        password: undefined,
-        capabilityToken: CAPABILITY_TOKEN,
-        authorizationHeader: undefined,
-      }),
-    ).toBe(true);
+  test("an agent credential authenticates as exactly that agent", async () => {
+    const credentials = new AgentMcpCredentials();
+    const tokenA = credentials.issue("agent-a");
+    const tokenB = credentials.issue("agent-b");
+
+    for (const password of [CORRECT_PASSWORD_HASH, undefined]) {
+      expect(
+        await authenticate({ credentials, password, authorizationHeader: `Bearer ${tokenA}` }),
+      ).toEqual({ kind: "agent", agentId: "agent-a" });
+      expect(
+        await authenticate({ credentials, password, authorizationHeader: `Bearer ${tokenB}` }),
+      ).toEqual({ kind: "agent", agentId: "agent-b" });
+    }
   });
 
-  test("accepts the injected capability token", async () => {
+  test("a revoked agent credential is rejected on a password-protected daemon", async () => {
+    const credentials = new AgentMcpCredentials();
+    const token = credentials.issue("agent-a");
+    credentials.revoke("agent-a");
+
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authenticate({
+        credentials,
         password: CORRECT_PASSWORD_HASH,
-        capabilityToken: CAPABILITY_TOKEN,
-        authorizationHeader: `Bearer ${CAPABILITY_TOKEN}`,
+        authorizationHeader: `Bearer ${token}`,
       }),
-    ).toBe(true);
+    ).toBeNull();
   });
 
-  test("still accepts a valid daemon-password bearer", async () => {
+  test("a valid daemon-password bearer authenticates as the owner", async () => {
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authenticate({
+        credentials: new AgentMcpCredentials(),
         password: CORRECT_PASSWORD_HASH,
-        capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: "Bearer correct-password",
       }),
-    ).toBe(true);
+    ).toEqual({ kind: "owner" });
   });
 
-  test("rejects requests presenting neither the token nor a valid password", async () => {
+  test("rejects requests with neither an agent credential nor the daemon password", async () => {
+    const credentials = new AgentMcpCredentials();
+    credentials.issue("agent-a");
+
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authenticate({
+        credentials,
         password: CORRECT_PASSWORD_HASH,
-        capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: undefined,
       }),
-    ).toBe(false);
+    ).toBeNull();
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authenticate({
+        credentials,
         password: CORRECT_PASSWORD_HASH,
-        capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: "Bearer wrong-token",
       }),
-    ).toBe(false);
+    ).toBeNull();
+  });
+
+  test("treats any other caller as the owner when no daemon password is configured", async () => {
+    expect(
+      await authenticate({
+        credentials: new AgentMcpCredentials(),
+        password: undefined,
+        authorizationHeader: undefined,
+      }),
+    ).toEqual({ kind: "owner" });
+  });
+});
+
+describe("agent MCP caller resolution", () => {
+  test("an agent acts as itself whether or not it names itself", () => {
+    const principal = { kind: "agent", agentId: "agent-a" } as const;
+
+    expect(resolveAgentMcpCaller({ principal, requestedCallerAgentId: undefined })).toEqual({
+      callerAgentId: "agent-a",
+    });
+    expect(resolveAgentMcpCaller({ principal, requestedCallerAgentId: "agent-a" })).toEqual({
+      callerAgentId: "agent-a",
+    });
+  });
+
+  test("an agent cannot name another agent as the caller", () => {
+    expect(
+      resolveAgentMcpCaller({
+        principal: { kind: "agent", agentId: "agent-a" },
+        requestedCallerAgentId: "agent-b",
+      }),
+    ).toBeNull();
+  });
+
+  test("the owner may act for a named agent or for no agent", () => {
+    const principal = { kind: "owner" } as const;
+
+    expect(resolveAgentMcpCaller({ principal, requestedCallerAgentId: "agent-b" })).toEqual({
+      callerAgentId: "agent-b",
+    });
+    expect(resolveAgentMcpCaller({ principal, requestedCallerAgentId: undefined })).toEqual({
+      callerAgentId: undefined,
+    });
   });
 });

@@ -2822,7 +2822,8 @@ test("createAgent injects paseo MCP server only into provider launch config", as
   expect(client.lastConfig?.mcpServers).toEqual({
     paseo: {
       type: "http",
-      url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}`,
+      url: "http://127.0.0.1:6767/mcp/agents",
+      headers: { Authorization: expect.stringMatching(/^Bearer \S+$/) },
     },
     custom: {
       type: "stdio",
@@ -3107,7 +3108,6 @@ test("createAgent allows best-effort internal MCP when the provider session repo
     registry: storage,
     logger,
     mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
-    mcpAuthToken: "cap-token",
     idFactory: () => "00000000-0000-4000-8000-000000000104",
   });
 
@@ -3120,12 +3120,103 @@ test("createAgent allows best-effort internal MCP when the provider session repo
     { workspaceId: undefined },
   );
 
-  expect(manager.getMcpAuthToken()).toBe("cap-token");
   expect(client.lastConfig?.mcpServers?.paseo).toEqual({
     type: "http",
-    url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}`,
-    headers: { Authorization: "Bearer cap-token" },
+    url: "http://127.0.0.1:6767/mcp/agents",
+    headers: { Authorization: expect.stringMatching(/^Bearer \S+$/) },
   });
+  expect(manager.resolveMcpCredential(readPaseoMcpCredential(client.lastConfig))).toBe(snapshot.id);
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+function readPaseoMcpCredential(config: Partial<AgentSessionConfig> | null | undefined): string {
+  const server = config?.mcpServers?.paseo;
+  const authorization =
+    server && server.type !== "stdio" ? server.headers?.Authorization : undefined;
+  const token = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : "";
+  if (!token) {
+    throw new Error("Launch config has no Paseo MCP credential");
+  }
+  return token;
+}
+
+test("each agent launches with its own MCP credential, bound to that agent", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-mcp-credential-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+  });
+
+  const agentA = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const agentB = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const tokenA = readPaseoMcpCredential(client.createdConfigs[0]);
+  const tokenB = readPaseoMcpCredential(client.createdConfigs[1]);
+
+  expect(tokenA).not.toBe(tokenB);
+  expect(manager.resolveMcpCredential(tokenA)).toBe(agentA.id);
+  expect(manager.resolveMcpCredential(tokenB)).toBe(agentB.id);
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+test("closing or archiving an agent revokes its MCP credential", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-mcp-credential-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+  });
+
+  const closed = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const archived = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const closedToken = readPaseoMcpCredential(client.createdConfigs[0]);
+  const archivedToken = readPaseoMcpCredential(client.createdConfigs[1]);
+
+  await manager.closeAgent(closed.id);
+  await manager.archiveAgent(archived.id);
+
+  expect(manager.resolveMcpCredential(closedToken)).toBeNull();
+  expect(manager.resolveMcpCredential(archivedToken)).toBeNull();
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+test("reloading an agent keeps its MCP credential", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-mcp-credential-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+  });
+
+  const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const token = readPaseoMcpCredential(client.createdConfigs[0]);
+
+  await manager.reloadAgentSession(snapshot.id);
+
+  expect(readPaseoMcpCredential(client.resumeOverrides.at(-1))).toBe(token);
+  expect(manager.resolveMcpCredential(token)).toBe(snapshot.id);
 
   rmSync(workdir, { recursive: true, force: true });
 });
@@ -3262,8 +3353,12 @@ test("keeps the global Paseo-tools gate outside provider policy and MCP injectio
 
   expect(enabledClient.lastConfig?.mcpServers?.paseo).toEqual({
     type: "http",
-    url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${enabledAgent.id}`,
+    url: "http://127.0.0.1:6767/mcp/agents",
+    headers: { Authorization: expect.stringMatching(/^Bearer \S+$/) },
   });
+  expect(
+    enabledManager.resolveMcpCredential(readPaseoMcpCredential(enabledClient.lastConfig)),
+  ).toBe(enabledAgent.id);
 
   const disabledClient = new McpClient();
   let catalogFactoryCalls = 0;
@@ -3331,7 +3426,8 @@ test("resumeAgentFromPersistence replaces stored internal paseo MCP with current
   expect(client.resumeOverrides[0]?.mcpServers).toEqual({
     paseo: {
       type: "http",
-      url: `http://127.0.0.1:6768/mcp/agents?callerAgentId=${snapshot.id}`,
+      url: "http://127.0.0.1:6768/mcp/agents",
+      headers: { Authorization: expect.stringMatching(/^Bearer \S+$/) },
     },
     custom: {
       type: "stdio",

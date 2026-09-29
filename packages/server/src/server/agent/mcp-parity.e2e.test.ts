@@ -55,13 +55,11 @@ function formatHostForHttpUrl(host: string): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
 
-function buildExpectedAgentMcpUrl(params: { host: string; port: number; agentId: string }): string {
-  const baseUrl = new URL(
+function buildExpectedAgentMcpUrl(params: { host: string; port: number }): string {
+  return new URL(
     "/mcp/agents",
     `http://${formatHostForHttpUrl(params.host)}:${params.port}`,
-  );
-  baseUrl.searchParams.set("callerAgentId", params.agentId);
-  return baseUrl.toString();
+  ).toString();
 }
 
 function getStructuredContent(result: McpToolResult): StructuredContent | null {
@@ -385,7 +383,6 @@ describe("Suite A: Core Fixes", () => {
       const expectedUrl = buildExpectedAgentMcpUrl({
         host: listenTarget!.host,
         port: listenTarget!.port,
-        agentId,
       });
 
       const launchConfig = launchConfigsByProvider.claude
@@ -395,8 +392,13 @@ describe("Suite A: Core Fixes", () => {
         paseo: {
           type: "http",
           url: expectedUrl,
+          headers: { Authorization: expect.stringMatching(/^Bearer \S+$/) },
         },
       });
+      const injected = launchConfig?.mcpServers?.paseo;
+      const credential =
+        injected?.type === "http" ? injected.headers?.Authorization?.slice("Bearer ".length) : "";
+      expect(daemonHandle.daemon.agentManager.resolveMcpCredential(credential ?? "")).toBe(agentId);
       expect(snapshot.config.mcpServers?.paseo).toBeUndefined();
 
       const liveAgent = daemonHandle.daemon.agentManager.getAgent(agentId);
