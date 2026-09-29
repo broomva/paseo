@@ -189,6 +189,36 @@ describe("toStoredAgentRecord", () => {
     expect(agent.persistence!.sessionId).toBe("persist-2");
   });
 
+  it("does not persist the injected Paseo MCP server echoed into provider metadata", () => {
+    const hub = {
+      type: "http",
+      url: "https://hub.test/mcp",
+      headers: { Authorization: "Bearer hub-credential" },
+    };
+    const agent = createManagedAgent({
+      persistence: {
+        provider: "claude",
+        sessionId: "persist-mcp",
+        metadata: {
+          model: "opus",
+          mcpServers: {
+            paseo: {
+              type: "http",
+              url: "http://127.0.0.1:6767/mcp/agents",
+              headers: { Authorization: "Bearer agent-credential" },
+            },
+            hub,
+          },
+        },
+      },
+    });
+
+    const record = toStoredAgentRecord(agent);
+
+    expect(record.persistence?.metadata).toEqual({ model: "opus", mcpServers: { hub } });
+    expect(JSON.stringify(record)).not.toContain("agent-credential");
+  });
+
   it("falls back to config mode when current mode is null and handles null title", () => {
     const agent = createManagedAgent({
       currentModeId: null,

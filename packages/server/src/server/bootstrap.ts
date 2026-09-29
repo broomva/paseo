@@ -3,7 +3,6 @@ import express from "express";
 import { createServer as createHTTPServer, type IncomingMessage, type ServerResponse } from "http";
 import { constants, existsSync, unlinkSync } from "fs";
 import { open, rm } from "fs/promises";
-import { randomUUID } from "node:crypto";
 import { hostname as getHostname } from "node:os";
 import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -202,7 +201,8 @@ import { terminateWithTreeKill } from "../utils/tree-kill.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   createRequireBearerMiddleware,
-  isAgentMcpRequestAuthorized,
+  authenticateAgentMcpRequest,
+  resolveAgentMcpCaller,
   type DaemonAuthConfig,
 } from "./auth.js";
 import { createWebUiMiddleware } from "./web-ui.js";
@@ -629,15 +629,6 @@ export async function createPaseoDaemon(
     ttlMs: downloadTokenTtlMs,
   });
 
-  // Capability token authenticating the daemon's own agents to the loopback
-  // Agent MCP endpoint (/mcp/agents). Random per daemon run, injected only into
-  // local agent configs and the daemon's own MCP client — never sent to remote
-  // clients — so it cannot be replayed off-box. This lets the injected MCP
-  // authenticate even when the daemon password is set via the app (hash only,
-  // no plaintext available). Mirrors the /api/files/download capability-token
-  // pattern.
-  const agentMcpAuthToken = randomUUID();
-
   const listenTarget = parseListenString(config.listen);
 
   const app = express();
@@ -928,7 +919,6 @@ export async function createPaseoDaemon(
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
     },
-    mcpAuthToken: agentMcpAuthToken,
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,
@@ -1478,16 +1468,15 @@ export async function createPaseoDaemon(
         return;
       }
       // This route is exempt from the global daemon-password middleware, so it
-      // authenticates here using the injected capability token (or a valid
-      // daemon password). Without this, a password-protected daemon would be
-      // wide open on its agent control plane.
-      if (
-        !(await isAgentMcpRequestAuthorized({
-          password: config.auth?.password,
-          capabilityToken: agentMcpAuthToken,
-          authorizationHeader: req.header("authorization"),
-        }))
-      ) {
+      // authenticates here: each agent presents its own credential, which also
+      // decides which agent the tools act for, and other callers need the
+      // daemon password when one is set.
+      const principal = await authenticateAgentMcpRequest({
+        password: config.auth?.password,
+        resolveAgentCredential: (token) => agentManager.resolveMcpCredential(token),
+        authorizationHeader: req.header("authorization"),
+      });
+      if (!principal) {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
@@ -1519,13 +1508,18 @@ export async function createPaseoDaemon(
           return;
         }
         const callerAgentIdRaw = req.query.callerAgentId;
-        let callerAgentId: string | undefined;
+        let requestedCallerAgentId: string | undefined;
         if (typeof callerAgentIdRaw === "string") {
-          callerAgentId = callerAgentIdRaw;
+          requestedCallerAgentId = callerAgentIdRaw;
         } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
-          callerAgentId = callerAgentIdRaw[0];
+          requestedCallerAgentId = callerAgentIdRaw[0];
         }
-        const { server, transport } = await createAgentMcpSession(callerAgentId);
+        const caller = resolveAgentMcpCaller({ principal, requestedCallerAgentId });
+        if (!caller) {
+          res.status(403).json({ error: "callerAgentId does not match the agent credential" });
+          return;
+        }
+        const { server, transport } = await createAgentMcpSession(caller.callerAgentId);
         res.on("close", () => {
           void transport.close();
           void server.close();

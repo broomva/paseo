@@ -1,5 +1,4 @@
 import { compare, compareSync, hashSync } from "bcryptjs";
-import { timingSafeEqual } from "node:crypto";
 import type { RequestHandler } from "express";
 
 export const DAEMON_PASSWORD_BCRYPT_COST = 12;
@@ -133,30 +132,52 @@ export function shouldBypassBearerAuth(method: string, path: string): boolean {
 }
 
 /**
- * Authorizes a request to the Agent MCP endpoint (/mcp/agents), which is exempt
- * from the global daemon-password middleware. Accepts either the per-daemon-run
- * capability token the daemon injects into its own agents' configs and MCP
- * client, or a valid daemon-password bearer (so existing password-authenticated
- * callers keep working). When no daemon password is configured the endpoint is
- * open, matching the global middleware's behavior.
+ * Who is calling the Agent MCP endpoint (/mcp/agents). An agent credential
+ * identifies exactly one agent. The owner is a daemon-password bearer, or any
+ * caller when no password is configured, matching the global middleware.
  */
-export async function isAgentMcpRequestAuthorized(input: {
+export type AgentMcpPrincipal = { kind: "agent"; agentId: string } | { kind: "owner" };
+
+/**
+ * Authenticates a request to the Agent MCP endpoint, which is exempt from the
+ * global daemon-password middleware. Returns null when the request must be
+ * rejected.
+ */
+export async function authenticateAgentMcpRequest(input: {
   password: string | undefined;
-  capabilityToken: string | null;
+  resolveAgentCredential: (token: string) => string | null;
   authorizationHeader: string | undefined;
-}): Promise<boolean> {
-  if (!input.password) {
-    return true;
-  }
+}): Promise<AgentMcpPrincipal | null> {
   const token = extractHttpBearerToken(input.authorizationHeader);
-  if (input.capabilityToken !== null && token !== null) {
-    // Constant-time compare; length-guard first because timingSafeEqual throws
-    // on differing buffer lengths.
-    const provided = Buffer.from(token);
-    const expected = Buffer.from(input.capabilityToken);
-    if (provided.length === expected.length && timingSafeEqual(provided, expected)) {
-      return true;
-    }
+  const agentId = token === null ? null : input.resolveAgentCredential(token);
+  if (agentId !== null) {
+    return { kind: "agent", agentId };
   }
-  return isBearerTokenValidAsync({ password: input.password, token });
+  if (await isBearerTokenValidAsync({ password: input.password, token })) {
+    return { kind: "owner" };
+  }
+  return null;
+}
+
+/**
+ * Resolves the caller agent the MCP tools act for. An agent credential is the
+ * caller's identity, so a callerAgentId naming any other agent is rejected
+ * (null). The owner already controls every agent and may name one explicitly.
+ */
+export interface AgentMcpCaller {
+  callerAgentId: string | undefined;
+}
+
+export function resolveAgentMcpCaller(input: {
+  principal: AgentMcpPrincipal;
+  requestedCallerAgentId: string | undefined;
+}): AgentMcpCaller | null {
+  const { principal, requestedCallerAgentId } = input;
+  if (principal.kind === "owner") {
+    return { callerAgentId: requestedCallerAgentId };
+  }
+  if (requestedCallerAgentId !== undefined && requestedCallerAgentId !== principal.agentId) {
+    return null;
+  }
+  return { callerAgentId: principal.agentId };
 }

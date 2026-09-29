@@ -20,6 +20,7 @@ import type {
 import type { ManagedAgent } from "./agent-manager.js";
 import type { JsonValue } from "../json-utils.js";
 import { isStoredAgentProviderAvailable, toAgentPersistenceHandle } from "../persistence-hooks.js";
+import { stripInternalPaseoMcpServerFromMetadata } from "./runtime-mcp-config.js";
 export type { ManagedAgent };
 
 interface ProjectionOptions {
@@ -369,7 +370,7 @@ function sanitizePersistenceHandle(
   }
   const metadata = sanitizeMetadata(handle.metadata);
   if (metadata !== undefined) {
-    sanitized.metadata = metadata;
+    sanitized.metadata = stripInternalPaseoMcpServerFromMetadata(metadata);
   }
   return sanitized;
 }

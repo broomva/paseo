@@ -1,4 +1,7 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { query, type Options, type Query, type SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 
 import {
@@ -54,6 +57,41 @@ function resolveClaudeSpawnCommand(
   };
 }
 
+const MCP_CONFIG_FLAG = "--mcp-config";
+
+interface MaterializedMcpConfigArgs {
+  args: string[];
+  cleanup: () => void;
+}
+
+/**
+ * The SDK hands MCP server configs to the CLI as inline JSON after
+ * --mcp-config, where any local user can read them with `ps`. Those configs
+ * carry credentials (the agent's Paseo MCP credential and any headers or env of
+ * user servers), so write each one to an owner-only file and pass its path; the
+ * CLI accepts either form.
+ */
+function moveInlineMcpConfigsToFiles(args: string[]): MaterializedMcpConfigArgs {
+  let directory: string | null = null;
+  const nextArgs = args.map((arg, index) => {
+    if (args[index - 1] !== MCP_CONFIG_FLAG || !arg.trimStart().startsWith("{")) {
+      return arg;
+    }
+    directory ??= mkdtempSync(path.join(tmpdir(), "paseo-claude-mcp-"));
+    const filePath = path.join(directory, `mcp-config-${index}.json`);
+    writeFileSync(filePath, arg, { encoding: "utf8", mode: 0o600 });
+    return filePath;
+  });
+  return {
+    args: nextArgs,
+    cleanup: () => {
+      if (directory) {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
 function applyRuntimeSettingsToClaudeOptions(
   options: ClaudeOptions,
   context: ClaudeQueryContext,
@@ -63,6 +101,12 @@ function applyRuntimeSettingsToClaudeOptions(
     ...options,
     spawnClaudeCodeProcess: (spawnOptions) => {
       const resolved = resolveClaudeSpawnCommand(spawnOptions, runtimeSettings);
+      // A replacement command can run Claude where this host's temp files do not
+      // exist (a container, a remote shell), so it keeps the inline form.
+      const mcpConfigFiles =
+        runtimeSettings?.command?.mode === "replace"
+          ? { args: resolved.args, cleanup: () => undefined }
+          : moveInlineMcpConfigsToFiles(resolved.args);
       // When the SDK passes a default JS runtime ("node"/"bun"), replace it with
       // process.execPath — the actual node binary running the daemon. This avoids
       // PATH lookup failures in the managed runtime bundle.
@@ -80,22 +124,31 @@ function applyRuntimeSettingsToClaudeOptions(
         overlays: [launchEnv],
       });
       const selfNodeCommand = isDefaultRuntime
-        ? buildSelfNodeCommand(resolved.args, providerEnv)
+        ? buildSelfNodeCommand(mcpConfigFiles.args, providerEnv)
         : null;
       const command = selfNodeCommand?.command ?? resolved.command;
-      const args = selfNodeCommand?.args ?? resolved.args;
-      const child = spawnProcess(command, args, {
-        cwd: spawnOptions.cwd,
-        ...(selfNodeCommand
-          ? { env: selfNodeCommand.env, envMode: "internal" as const }
-          : providerEnvSpec),
-        signal: spawnOptions.signal,
-        stdio: ["pipe", "pipe", "pipe"],
-        // Bypass cmd.exe on Windows: the SDK passes --mcp-config with inline JSON
-        // containing double quotes, which cmd.exe mangles (strips quotes, breaks parsing).
-        // The command is always a resolved binary path, so shell routing is unnecessary.
-        shell: false,
-      });
+      const args = selfNodeCommand?.args ?? mcpConfigFiles.args;
+      let child: ChildProcess;
+      try {
+        child = spawnProcess(command, args, {
+          cwd: spawnOptions.cwd,
+          ...(selfNodeCommand
+            ? { env: selfNodeCommand.env, envMode: "internal" as const }
+            : providerEnvSpec),
+          signal: spawnOptions.signal,
+          stdio: ["pipe", "pipe", "pipe"],
+          // Bypass cmd.exe on Windows: the SDK passes flags such as --settings with inline
+          // JSON containing double quotes, which cmd.exe mangles (strips quotes, breaks
+          // parsing). The command is always a resolved binary path, so shell routing is
+          // unnecessary.
+          shell: false,
+        });
+      } catch (error) {
+        mcpConfigFiles.cleanup();
+        throw error;
+      }
+      child.once("exit", mcpConfigFiles.cleanup);
+      child.once("error", mcpConfigFiles.cleanup);
       onChildProcess?.(child);
       if (typeof options.stderr === "function") {
         child.stderr?.on("data", (chunk: Buffer | string) => {
